@@ -94,6 +94,7 @@
   const MAX_DECODE = 1600;            // long edge kept in memory per photo (iOS canvas memory is tight)
   const MAX_ZOOM = 5;
   const GAP = 1.5;
+  const FADE_MS = 250;
 
   const $ = (s) => document.querySelector(s);
   const canvas = $('#story'), ctx = canvas.getContext('2d');
@@ -102,7 +103,9 @@
 
   // Photo transform is relative to its cell so it renders the same at any output size.
   // Sized for the largest layout so photos survive switching to a smaller grid and back.
-  const photos = new Array(MAX_CELLS).fill(null); // { img, zoom, offX, offY }
+  const photos = new Array(MAX_CELLS).fill(null); // { img, zoom, offX, offY, addedAt }
+  const loading = new Set(); // cells waiting for a photo to arrive/decode
+  let rafId = 0;
   let cells = LAYOUTS[0];
   let selected = 0;
   let busy = false;
@@ -143,20 +146,41 @@
     g.drawImage(p.img, x, y, dw, dh);
     g.restore();
   }
-  function drawEmpty(g, c) {
+  function drawEmpty(g, c, showPlus) {
     g.fillStyle = '#262626'; g.fillRect(c.x, c.y, c.w, c.h);
+    if (!showPlus) return;
     const r = Math.min(20, Math.min(c.w, c.h) / 4), cx = c.x + c.w / 2, cy = c.y + c.h / 2, arm = r * .45;
     g.fillStyle = 'rgba(255,255,255,.15)';
     g.beginPath(); g.arc(cx, cy, r, 0, Math.PI * 2); g.fill();
     g.strokeStyle = 'rgba(255,255,255,.87)'; g.lineWidth = 2.5; g.lineCap = 'round';
     g.beginPath(); g.moveTo(cx - arm, cy); g.lineTo(cx + arm, cy); g.moveTo(cx, cy - arm); g.lineTo(cx, cy + arm); g.stroke();
   }
+  function drawSpinner(g, c, now, overlay) {
+    if (overlay) { g.fillStyle = 'rgba(0,0,0,.45)'; g.fillRect(c.x, c.y, c.w, c.h); }
+    const r = Math.min(16, Math.min(c.w, c.h) / 5), cx = c.x + c.w / 2, cy = c.y + c.h / 2;
+    const start = (now / 1000) * Math.PI * 2.2;
+    g.lineWidth = 3; g.lineCap = 'round';
+    g.strokeStyle = 'rgba(255,255,255,.2)';
+    g.beginPath(); g.arc(cx, cy, r, 0, Math.PI * 2); g.stroke();
+    g.strokeStyle = '#fff';
+    g.beginPath(); g.arc(cx, cy, r, start, start + Math.PI * 1.3); g.stroke();
+  }
   function drawCells(g, w, h, gap, editor) {
+    const now = performance.now();
     cells.forEach((_, i) => {
       const c = cellRect(i, w, h, gap);
-      if (photos[i]) drawPhoto(g, photos[i], c);
-      else if (editor) drawEmpty(g, c);
+      const p = photos[i];
+      const isLoading = editor && loading.has(i);
+      if (p && editor) {
+        // New photos fade in so it's obvious when they land.
+        const a = clamp((now - p.addedAt) / FADE_MS, 0, 1);
+        if (a < 1) { g.fillStyle = '#262626'; g.fillRect(c.x, c.y, c.w, c.h); }
+        g.globalAlpha = a; drawPhoto(g, p, c); g.globalAlpha = 1;
+      }
+      else if (p) drawPhoto(g, p, c);
+      else if (editor) drawEmpty(g, c, !isLoading);
       else { g.fillStyle = '#1a1a1a'; g.fillRect(c.x, c.y, c.w, c.h); }
+      if (isLoading) drawSpinner(g, c, now, !!p);
       if (editor && i === selected) {
         g.strokeStyle = '#fff'; g.lineWidth = 3;
         g.strokeRect(c.x + 1.5, c.y + 1.5, c.w - 3, c.h - 3);
@@ -168,6 +192,14 @@
     ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cssW, cssH);
     drawCells(ctx, cssW, cssH, GAP, true);
   }
+
+  // Animation loop runs only while a spinner or fade-in is on screen.
+  function animating() {
+    const now = performance.now();
+    return loading.size > 0 || photos.some((p) => p && now - p.addedAt < FADE_MS);
+  }
+  function kick() { if (!rafId) rafId = requestAnimationFrame(frame); }
+  function frame() { rafId = 0; render(); if (animating()) kick(); }
 
   // Keep the editor exactly 9:16, as large as the space between the bars allows.
   function fit() {
@@ -229,6 +261,9 @@
   function pick(targets) {
     if (!targets.length || busy) return;
     pending = targets;
+    // Show spinners right away: iOS converts photos (HEIC -> JPEG) before 'change' fires.
+    targets.forEach((c) => loading.add(c));
+    kick();
     fileInput.multiple = targets.length > 1;
     fileInput.value = '';
     fileInput.click();
@@ -254,20 +289,35 @@
   fileInput.addEventListener('change', async () => {
     const files = [...fileInput.files];
     const assign = pending.map((cell, i) => [cell, files[i]]).filter(([, f]) => f);
-    if (!assign.length) return;
-    busy = true; refresh();
+    // Fewer photos picked than empty cells: stop spinning on the leftovers.
+    pending.forEach((cell) => { if (!assign.some(([c]) => c === cell)) loading.delete(cell); });
+    pending = [];
+    if (!assign.length) { render(); return; }
+    busy = true; refresh(); kick();
     let failed = 0, last = selected;
-    for (const [cell, f] of assign) {
-      try {
-        photos[cell] = { img: await decode(f), zoom: 1, offX: 0, offY: 0 };
-        last = cell;
-        render();
-      } catch { failed++; }
-    }
+    // Two at a time: faster than one-by-one without spiking memory on iPhone.
+    const queue = assign.slice();
+    const work = async () => {
+      while (queue.length) {
+        const [cell, f] = queue.shift();
+        try {
+          photos[cell] = { img: await decode(f), zoom: 1, offX: 0, offY: 0, addedAt: performance.now() };
+          last = cell;
+        } catch { failed++; }
+        loading.delete(cell);
+        kick();
+      }
+    };
+    await Promise.all([work(), work()]);
     if (failed) toast("Some photos couldn't be opened");
     busy = false;
     // Like Instagram: move on to the next empty cell after filling one.
     select(emptyCells()[0] ?? last);
+  });
+  fileInput.addEventListener('cancel', () => {
+    pending.forEach((cell) => loading.delete(cell));
+    pending = [];
+    render();
   });
 
   // ---- touch: tap selects/fills, one finger pans, two fingers pinch ----
