@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Story Layout">
+<meta name="theme-color" content="#000000">
+<link rel="apple-touch-icon" href="icon.png">
+<link rel="manifest" href="manifest.webmanifest">
+<title>Story Layout</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; height: 100%; background: #000; color: #fff; overflow: hidden; overscroll-behavior: none;
+    font: 14px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  }
+  #app {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  .bar { display: flex; align-items: center; gap: 8px; padding: 10px 16px; }
+  .spacer { flex: 1; }
+  .pill {
+    height: 36px; padding: 0 16px; border-radius: 18px; border: 0; font: inherit; font-weight: 700;
+    background: rgba(255,255,255,.15); color: #fff; touch-action: manipulation; cursor: pointer;
+  }
+  .pill.primary { background: #fff; color: #000; }
+  .pill:disabled { opacity: .35; cursor: default; }
+  .pill:active:not(:disabled) { filter: brightness(1.3); }
+  #stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 0 16px; }
+  #story { display: block; border-radius: 14px; touch-action: none; background: #000; }
+  .hint { text-align: center; color: rgba(255,255,255,.5); font-size: 12px; padding: 8px 16px 0; }
+  .actions { display: flex; justify-content: center; gap: 8px; padding: 10px 16px 4px; }
+  #layouts { display: flex; gap: 10px; overflow-x: auto; padding: 10px 16px 14px; scrollbar-width: none; }
+  #layouts::-webkit-scrollbar { display: none; }
+  .thumb {
+    flex: 0 0 auto; position: relative; width: 36px; height: 64px; padding: 0; border: 0;
+    background: none; border-radius: 4px; cursor: pointer; touch-action: manipulation;
+  }
+  .thumb.chosen { box-shadow: inset 0 0 0 1.5px #fff; }
+  .thumb i { position: absolute; border-radius: 2px; background: rgba(255,255,255,.3); }
+  .thumb.chosen i { background: #fff; }
+  #toast {
+    position: fixed; left: 50%; bottom: calc(120px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+    background: rgba(40,40,40,.95); color: #fff; padding: 10px 16px; border-radius: 18px; font-size: 13px;
+    opacity: 0; transition: opacity .2s; pointer-events: none; white-space: nowrap;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="bar">
+    <button class="pill" id="btnClear">Clear</button>
+    <div class="spacer"></div>
+    <button class="pill primary" id="btnSave">Save</button>
+  </div>
+  <div id="stage"><canvas id="story"></canvas></div>
+  <div class="hint">Tap a cell to add a photo · drag or pinch to adjust</div>
+  <div class="actions">
+    <button class="pill" id="btnAdd">Add photos</button>
+    <button class="pill" id="btnReplace">Replace</button>
+    <button class="pill" id="btnRemove">Remove</button>
+  </div>
+  <div id="layouts"></div>
+</div>
+<input type="file" id="file" accept="image/*" hidden>
+<div id="toast"></div>
+
+<script>
+(() => {
+  // ---- layouts: cells in normalized (0..1) story coordinates ----
+  const R = (l, t, r, b) => ({ l, t, r, b });
+  const T = 1 / 3, TT = 2 / 3;
+  const LAYOUTS = [
+    [R(0, 0, 1, .5), R(0, .5, 1, 1)],                                   // 2 stacked
+    [R(0, 0, .5, 1), R(.5, 0, 1, 1)],                                   // 2 side by side
+    [R(0, 0, 1, T), R(0, T, 1, TT), R(0, TT, 1, 1)],                    // 3 rows
+    [R(0, 0, T, 1), R(T, 0, TT, 1), R(TT, 0, 1, 1)],                    // 3 columns
+    [R(0, 0, 1, .5), R(0, .5, .5, 1), R(.5, .5, 1, 1)],                 // 1 top, 2 bottom
+    [R(0, 0, .5, .5), R(.5, 0, 1, .5), R(0, .5, 1, 1)],                 // 2 top, 1 bottom
+    [R(0, 0, .5, 1), R(.5, 0, 1, .5), R(.5, .5, 1, 1)],                 // 1 left, 2 right
+    [R(0, 0, .5, .5), R(.5, 0, 1, .5), R(0, .5, .5, 1), R(.5, .5, 1, 1)], // 2 x 2
+    [R(0, 0, .5, T), R(.5, 0, 1, T), R(0, T, .5, TT), R(.5, T, 1, TT), R(0, TT, .5, 1), R(.5, TT, 1, 1)], // 2 x 3
+    Array.from({ length: 9 }, (_, i) => R((i % 3) / 3, Math.floor(i / 3) / 3, (i % 3) / 3 + T, Math.floor(i / 3) / 3 + T)), // 3 x 3
+  ];
+  const MAX_CELLS = 9;
+  const OUT_W = 1080, OUT_H = 1920;   // always exactly 9:16
+  const MAX_DECODE = 1600;            // long edge kept in memory per photo (iOS canvas memory is tight)
+  const MAX_ZOOM = 5;
+  const GAP = 1.5;
+
+  const $ = (s) => document.querySelector(s);
+  const canvas = $('#story'), ctx = canvas.getContext('2d');
+  const fileInput = $('#file');
+  const btn = { add: $('#btnAdd'), replace: $('#btnReplace'), remove: $('#btnRemove'), save: $('#btnSave'), clear: $('#btnClear') };
+
+  // Photo transform is relative to its cell so it renders the same at any output size.
+  // Sized for the largest layout so photos survive switching to a smaller grid and back.
+  const photos = new Array(MAX_CELLS).fill(null); // { img, zoom, offX, offY }
+  let cells = LAYOUTS[0];
+  let selected = 0;
+  let busy = false;
+  let pending = [];
+  let cssW = 0, cssH = 0, dpr = 1;
+
+  const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+  const hasPhoto = (i) => i >= 0 && i < cells.length && photos[i] != null;
+  const emptyCells = () => cells.map((_, i) => i).filter((i) => !photos[i]);
+  const photoCount = () => cells.filter((_, i) => photos[i]).length;
+
+  // ---- drawing ----
+  function cellRect(i, w, h, gap) {
+    const n = cells[i];
+    const g = gap / 2;
+    const x = n.l * w + g, y = n.t * h + g;
+    return { x, y, w: n.r * w - g - x, h: n.b * h - g - y };
+  }
+  const baseScale = (p, c) => Math.max(c.w / p.img.width, c.h / p.img.height);
+  function maxOff(p, c, zoom) {
+    const s = baseScale(p, c) * zoom;
+    return [Math.max(0, (p.img.width * s - c.w) / 2 / c.w), Math.max(0, (p.img.height * s - c.h) / 2 / c.h)];
+  }
+  function clampOff(p, c) {
+    const [mx, my] = maxOff(p, c, p.zoom);
+    p.offX = clamp(p.offX, -mx, mx);
+    p.offY = clamp(p.offY, -my, my);
+  }
+  function drawPhoto(g, p, c) {
+    const s = baseScale(p, c) * p.zoom;
+    const [mx, my] = maxOff(p, c, p.zoom);
+    const dw = p.img.width * s, dh = p.img.height * s;
+    const x = c.x + c.w / 2 - dw / 2 + clamp(p.offX, -mx, mx) * c.w;
+    const y = c.y + c.h / 2 - dh / 2 + clamp(p.offY, -my, my) * c.h;
+    g.save();
+    g.beginPath(); g.rect(c.x, c.y, c.w, c.h); g.clip();
+    g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+    g.drawImage(p.img, x, y, dw, dh);
+    g.restore();
+  }
+  function drawEmpty(g, c) {
+    g.fillStyle = '#262626'; g.fillRect(c.x, c.y, c.w, c.h);
+    const r = Math.min(20, Math.min(c.w, c.h) / 4), cx = c.x + c.w / 2, cy = c.y + c.h / 2, arm = r * .45;
+    g.fillStyle = 'rgba(255,255,255,.15)';
+    g.beginPath(); g.arc(cx, cy, r, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = 'rgba(255,255,255,.87)'; g.lineWidth = 2.5; g.lineCap = 'round';
+    g.beginPath(); g.moveTo(cx - arm, cy); g.lineTo(cx + arm, cy); g.moveTo(cx, cy - arm); g.lineTo(cx, cy + arm); g.stroke();
+  }
+  function drawCells(g, w, h, gap, editor) {
+    cells.forEach((_, i) => {
+      const c = cellRect(i, w, h, gap);
+      if (photos[i]) drawPhoto(g, photos[i], c);
+      else if (editor) drawEmpty(g, c);
+      else { g.fillStyle = '#1a1a1a'; g.fillRect(c.x, c.y, c.w, c.h); }
+      if (editor && i === selected) {
+        g.strokeStyle = '#fff'; g.lineWidth = 3;
+        g.strokeRect(c.x + 1.5, c.y + 1.5, c.w - 3, c.h - 3);
+      }
+    });
+  }
+  function render() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cssW, cssH);
+    drawCells(ctx, cssW, cssH, GAP, true);
+  }
+
+  // Keep the editor exactly 9:16, as large as the space between the bars allows.
+  function fit() {
+    const stage = $('#stage');
+    const aw = stage.clientWidth - 32, ah = stage.clientHeight;
+    let w = aw, h = w * 16 / 9;
+    if (h > ah) { h = ah; w = h * 9 / 16; }
+    cssW = Math.max(1, Math.floor(w)); cssH = Math.max(1, Math.floor(h));
+    dpr = Math.min(window.devicePixelRatio || 1, 3);
+    canvas.style.width = cssW + 'px'; canvas.style.height = cssH + 'px';
+    canvas.width = Math.round(cssW * dpr); canvas.height = Math.round(cssH * dpr);
+    render();
+  }
+  new ResizeObserver(fit).observe($('#stage'));
+
+  // ---- state ----
+  function select(i) { selected = i; refresh(); render(); }
+  function setLayout(idx) {
+    cells = LAYOUTS[idx];
+    // Cell aspect ratios change, so previous pan/zoom no longer makes sense.
+    photos.forEach((p) => { if (p) { p.zoom = 1; p.offX = 0; p.offY = 0; } });
+    document.querySelectorAll('.thumb').forEach((t, j) => t.classList.toggle('chosen', j === idx));
+    select(emptyCells()[0] ?? 0);
+  }
+  function setEnabled(b, on) { b.disabled = !on; }
+  function refresh() {
+    const sel = hasPhoto(selected), any = photoCount() > 0;
+    setEnabled(btn.add, emptyCells().length > 0 && !busy);
+    setEnabled(btn.replace, sel && !busy);
+    setEnabled(btn.remove, sel && !busy);
+    setEnabled(btn.save, any && !busy);
+  }
+  let toastTimer;
+  function toast(msg) {
+    const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+  }
+
+  // ---- layout strip ----
+  const strip = $('#layouts');
+  LAYOUTS.forEach((layout, idx) => {
+    const b = document.createElement('button');
+    b.className = 'thumb' + (idx === 0 ? ' chosen' : '');
+    b.setAttribute('aria-label', `Layout with ${layout.length} photos`);
+    const pad = 2, gap = 2, w = 32, h = 60;
+    layout.forEach((n) => {
+      const i = document.createElement('i');
+      i.style.left = (pad + n.l * w + gap / 2) + 'px';
+      i.style.top = (pad + n.t * h + gap / 2) + 'px';
+      i.style.width = ((n.r - n.l) * w - gap) + 'px';
+      i.style.height = ((n.b - n.t) * h - gap) + 'px';
+      b.appendChild(i);
+    });
+    b.addEventListener('click', () => setLayout(idx));
+    strip.appendChild(b);
+  });
+
+  // ---- picking ----
+  function pick(targets) {
+    if (!targets.length || busy) return;
+    pending = targets;
+    fileInput.multiple = targets.length > 1;
+    fileInput.value = '';
+    fileInput.click();
+  }
+  async function decode(file) {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = new Image();
+      img.src = url;
+      await img.decode(); // browsers apply EXIF orientation to natural size
+      const s = Math.min(1, MAX_DECODE / Math.max(img.naturalWidth, img.naturalHeight));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.naturalWidth * s);
+      c.height = Math.round(img.naturalHeight * s);
+      const g = c.getContext('2d');
+      g.imageSmoothingQuality = 'high';
+      g.drawImage(img, 0, 0, c.width, c.height);
+      return c;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+  fileInput.addEventListener('change', async () => {
+    const files = [...fileInput.files];
+    const assign = pending.map((cell, i) => [cell, files[i]]).filter(([, f]) => f);
+    if (!assign.length) return;
+    busy = true; refresh();
+    let failed = 0, last = selected;
+    for (const [cell, f] of assign) {
+      try {
+        photos[cell] = { img: await decode(f), zoom: 1, offX: 0, offY: 0 };
+        last = cell;
+        render();
+      } catch { failed++; }
+    }
+    if (failed) toast("Some photos couldn't be opened");
+    busy = false;
+    // Like Instagram: move on to the next empty cell after filling one.
+    select(emptyCells()[0] ?? last);
+  });
+
+  // ---- touch: tap selects/fills, one finger pans, two fingers pinch ----
+  const pointers = new Map();
+  let activeCell = -1, tap = null, tapReady = false, pinch = null;
+  const local = (e) => { const r = canvas.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+  const cellAt = (x, y) => {
+    const nx = x / cssW, ny = y / cssH;
+    return cells.findIndex((n) => nx >= n.l && nx < n.r && ny >= n.t && ny < n.b);
+  };
+  const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+  function startPinch() {
+    const [a, b] = [...pointers.values()];
+    const m = mid(a, b);
+    let i = cellAt(m.x, m.y);
+    if (!hasPhoto(i)) i = activeCell;
+    if (!hasPhoto(i)) { pinch = null; return; }
+    activeCell = i;
+    if (selected !== i) select(i);
+    pinch = { d: dist(a, b), m };
+  }
+
+  canvas.addEventListener('pointerdown', (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    const pt = local(e);
+    pointers.set(e.pointerId, pt);
+    tapReady = false;
+    if (pointers.size === 1) { activeCell = cellAt(pt.x, pt.y); tap = pt; }
+    else { tap = null; if (pointers.size === 2) startPinch(); }
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    const prev = pointers.get(e.pointerId);
+    if (!prev) return;
+    const pt = local(e);
+    pointers.set(e.pointerId, pt);
+    if (tap && dist(pt, tap) > 8) tap = null;
+
+    if (pointers.size >= 2 && pinch) {
+      const [a, b] = [...pointers.values()];
+      const p = photos[activeCell], c = cellRect(activeCell, cssW, cssH, GAP);
+      const d = dist(a, b), m = mid(a, b);
+      const nz = clamp(p.zoom * d / pinch.d, 1, MAX_ZOOM), k = nz / p.zoom;
+      // Zoom about the fingers' midpoint and follow it as it moves.
+      const cx = m.x + (c.x + c.w / 2 + p.offX * c.w - pinch.m.x) * k;
+      const cy = m.y + (c.y + c.h / 2 + p.offY * c.h - pinch.m.y) * k;
+      p.offX = (cx - c.x - c.w / 2) / c.w;
+      p.offY = (cy - c.y - c.h / 2) / c.h;
+      p.zoom = nz;
+      clampOff(p, c);
+      pinch.d = d; pinch.m = m;
+      render();
+    } else if (pointers.size === 1 && !tap) {
+      const p = photos[activeCell];
+      if (!p) return;
+      if (selected !== activeCell) select(activeCell);
+      const c = cellRect(activeCell, cssW, cssH, GAP);
+      p.offX += (pt.x - prev.x) / c.w;
+      p.offY += (pt.y - prev.y) / c.h;
+      clampOff(p, c);
+      render();
+    }
+  });
+
+  function endPointer(e) {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.delete(e.pointerId);
+    tapReady = e.type === 'pointerup' && tap != null && pointers.size === 0;
+    if (pointers.size < 2) pinch = null;
+    if (pointers.size === 0) tap = tapReady ? tap : null;
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  // Taps are handled on click so opening the photo picker counts as a user gesture on iOS.
+  canvas.addEventListener('click', () => {
+    if (!tapReady || !tap) return;
+    tapReady = false;
+    const i = cellAt(tap.x, tap.y);
+    tap = null;
+    if (i < 0) return;
+    select(i);
+    if (!photos[i]) pick([i]);
+  });
+
+  // Stop iOS from zooming the whole page on pinch.
+  document.addEventListener('gesturestart', (e) => e.preventDefault());
+
+  // ---- buttons ----
+  btn.add.addEventListener('click', () => pick(emptyCells()));
+  btn.replace.addEventListener('click', () => pick([selected]));
+  btn.remove.addEventListener('click', () => { photos[selected] = null; select(selected); });
+  btn.clear.addEventListener('click', () => { photos.fill(null); select(0); });
+
+  // ---- export ----
+  function exportBlob() {
+    const c = document.createElement('canvas');
+    c.width = OUT_W; c.height = OUT_H;
+    const g = c.getContext('2d');
+    g.fillStyle = '#000'; g.fillRect(0, 0, OUT_W, OUT_H);
+    drawCells(g, OUT_W, OUT_H, 0, false);
+    // Synchronous encode keeps us inside the tap gesture, which iOS requires for the share sheet.
+    const bin = atob(c.toDataURL('image/jpeg', 0.95).split(',')[1]);
+    c.width = c.height = 0;
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: 'image/jpeg' });
+  }
+  function download(blob, name) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    toast('Downloaded ' + name);
+  }
+  btn.save.addEventListener('click', async () => {
+    if (busy || !photoCount()) return;
+    const name = `story_${Date.now()}.jpg`;
+    const blob = exportBlob();
+    const file = new File([blob], name, { type: 'image/jpeg' });
+    // On iPhone this opens the share sheet: "Save Image" puts it in Photos, or send it straight to Instagram.
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file] }); }
+      catch (err) { if (err.name !== 'AbortError') download(blob, name); }
+    } else {
+      download(blob, name);
+    }
+  });
+
+  refresh();
+})();
+</script>
+</body>
+</html>
